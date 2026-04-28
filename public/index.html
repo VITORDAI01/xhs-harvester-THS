@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>小红书爬取面板</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Xiaohongshu Crawler</p>
+          <h1>小红书作品采集</h1>
+        </div>
+        <div class="status" id="status">待命</div>
+      </section>
+
+      <section class="toolbar" aria-label="爬取控制">
+        <label class="field">
+          <span>起始日期</span>
+          <input id="since" type="text" inputmode="numeric" placeholder="2026-04-15" value="2026-04-15">
+        </label>
+        <button id="login" type="button" class="secondary">打开登录</button>
+        <button id="run" type="button" class="primary">开始爬取</button>
+        <button id="stop" type="button" class="danger" disabled>停止</button>
+      </section>
+
+      <section class="workspace">
+        <div class="panel logs-panel">
+          <div class="panel-title">
+            <h2>运行日志</h2>
+            <button id="clear" type="button" class="ghost">清空</button>
+          </div>
+          <pre id="logs" class="logs"></pre>
+        </div>
+
+        <div class="panel output-panel">
+          <div class="panel-title">
+            <h2>导出文件</h2>
+            <button id="refresh" type="button" class="ghost">刷新</button>
+          </div>
+          <div id="outputs" class="outputs"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
