@@ -136,6 +136,10 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
         return { tags: "", publishedAt: null, itemUrl: link.exportUrl, failed: true };
       });
 
+      if (detail.failed) {
+        continue;
+      }
+
       if (!detail.publishedAt) {
         console.warn(`未识别抖音发布时间：${detail.itemUrl || link.exportUrl}`);
         if (detail.dateCandidates) {
@@ -192,9 +196,6 @@ async function getPublishedItems(page) {
     const html = document.documentElement?.innerHTML || "";
     for (const match of html.matchAll(/https?:\\\/\\\/www\.douyin\.com\\\/(?:video|note)\\\/[A-Za-z0-9_-]+[^"'\\<\s]*/g)) {
       values.add(match[0].replaceAll("\\/", "/"));
-    }
-    for (const match of html.matchAll(/modal_id=([0-9A-Za-z_-]+)/g)) {
-      values.add(`${location.origin}${location.pathname}?modal_id=${match[1]}`);
     }
 
     return [...values];
@@ -428,16 +429,18 @@ function buildExcelXml(headers, rows) {
 function normalizeItemUrl(rawUrl) {
   if (!rawUrl || !/douyin\.com/.test(rawUrl)) return null;
   const url = new URL(rawUrl, "https://www.douyin.com");
+  const source = url.searchParams.get("source") || "";
+  if (/Baiduspider/i.test(source)) return null;
+
   const pathMatch = url.pathname.match(/\/(?:video|note)\/([A-Za-z0-9_-]+)/);
   const modalId = url.searchParams.get("modal_id");
-  const id = pathMatch?.[1] || modalId;
+  if (modalId) return null;
+
+  const id = pathMatch?.[1] || "";
   if (!id) return null;
-  if (modalId && !/^\/user\//.test(url.pathname)) return null;
   if (!/^\d{8,}$/.test(id) && !/^[A-Za-z0-9_-]{12,}$/.test(id)) return null;
 
-  const cleanUrl = pathMatch
-    ? `https://www.douyin.com${url.pathname}${url.search}`
-    : `https://www.douyin.com${url.pathname}?modal_id=${encodeURIComponent(id)}`;
+  const cleanUrl = `https://www.douyin.com${url.pathname}${url.search}`;
 
   return {
     id,
