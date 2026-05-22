@@ -16,38 +16,93 @@
         <div class="status" id="status">待命</div>
       </section>
 
-      <section class="platform-tabs" aria-label="平台切换">
-        <button id="platform-xhs" type="button" class="platform-tab active" data-platform="xhs">小红书</button>
-        <button id="platform-douyin" type="button" class="platform-tab" data-platform="douyin">抖音</button>
-      </section>
-
-      <section class="toolbar" aria-label="爬取控制">
-        <label class="field">
-          <span>起始日期</span>
-          <input id="since" type="text" inputmode="numeric" placeholder="2026-04-15" value="2026-04-15">
+      <section class="auth-panel" id="auth-panel" hidden>
+        <label class="field auth-field">
+          <span>共享口令</span>
+          <input id="panel-password" type="password" autocomplete="current-password">
         </label>
-        <button id="login" type="button" class="secondary">打开登录</button>
-        <button id="run" type="button" class="primary">开始爬取</button>
-        <button id="stop" type="button" class="danger" disabled>停止</button>
+        <button id="panel-login" type="button" class="primary">登录面板</button>
+        <div class="auth-status" id="panel-auth-status">请输入共享口令</div>
       </section>
 
-      <section class="workspace">
-        <div class="panel logs-panel">
-          <div class="panel-title">
-            <h2>运行日志</h2>
-            <button id="clear" type="button" class="ghost">清空</button>
-          </div>
-          <pre id="logs" class="logs"></pre>
-        </div>
+      <div id="panel-content" hidden>
+        <section class="platform-tabs" aria-label="平台切换">
+          <button id="platform-xhs" type="button" class="platform-tab active" data-platform="xhs">小红书</button>
+          <button id="platform-douyin" type="button" class="platform-tab" data-platform="douyin">抖音</button>
+          <button id="platform-bilibili" type="button" class="platform-tab" data-platform="bilibili">B站</button>
+          <button id="platform-daily" type="button" class="platform-tab" data-platform="daily">全渠道</button>
+        </section>
 
-        <div class="panel output-panel">
-          <div class="panel-title">
-            <h2>导出文件</h2>
-            <button id="refresh" type="button" class="ghost">刷新</button>
+        <section class="toolbar" aria-label="爬取控制">
+          <div class="toolbar-fields">
+            <label class="field">
+              <span id="date-label">起始日期</span>
+              <input id="since" type="date">
+            </label>
+            <label class="field" id="until-field">
+              <span>结束日期（不含）</span>
+              <input id="until" type="date">
+            </label>
+            <label class="field" id="account-field">
+              <span>账号</span>
+              <select id="account">
+                <option value="">全部账号</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>采集模式</span>
+              <select id="crawl-mode">
+                <option value="conservative" selected>保守提速</option>
+                <option value="legacy">兼容旧模式</option>
+              </select>
+            </label>
           </div>
-          <div id="outputs" class="outputs"></div>
-        </div>
-      </section>
+          <div class="toolbar-actions">
+            <button id="login" type="button" class="secondary">打开登录</button>
+            <button id="login-check" type="button" class="secondary">检测登录</button>
+            <button id="run" type="button" class="primary">开始爬取</button>
+            <button id="feishu-write" type="button" class="secondary">写入飞书</button>
+            <button id="stop" type="button" class="danger" disabled>停止</button>
+          </div>
+          <div class="login-check-status" id="login-check-status">未检测</div>
+        </section>
+
+        <section class="schedulebar" aria-label="每日采集设置">
+          <label class="field">
+            <span>全渠道日期</span>
+            <input id="target-date" type="date">
+          </label>
+          <button id="daily-run" type="button" class="primary">全渠道采集</button>
+          <label class="field compact">
+            <span>定时时间</span>
+            <input id="schedule-time" type="time" value="11:30">
+          </label>
+          <label class="toggle">
+            <input id="schedule-enabled" type="checkbox">
+            <span>启用定时</span>
+          </label>
+          <button id="save-schedule" type="button" class="secondary">保存定时</button>
+          <div class="schedule-status" id="schedule-status">未启用</div>
+        </section>
+
+        <section class="workspace">
+          <div class="panel logs-panel">
+            <div class="panel-title">
+              <h2>运行日志</h2>
+              <button id="clear" type="button" class="ghost">清空</button>
+            </div>
+            <pre id="logs" class="logs"></pre>
+          </div>
+
+          <div class="panel output-panel">
+            <div class="panel-title">
+              <h2>导出文件</h2>
+              <button id="refresh" type="button" class="ghost">刷新</button>
+            </div>
+            <div id="outputs" class="outputs"></div>
+          </div>
+        </section>
+      </div>
     </main>
 
     <script src="/app.js" type="module"></script>

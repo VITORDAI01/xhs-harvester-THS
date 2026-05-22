@@ -6,11 +6,19 @@
   "scripts": {
     "login": "node src/login-xhs.mjs",
     "login:douyin": "node src/login-douyin.mjs",
+    "login:bilibili": "node src/login-bilibili.mjs",
     "crawl": "node src/crawl-xhs.mjs",
     "crawl:douyin": "node src/crawl-douyin.mjs",
-    "ui": "node src/server.mjs"
+    "crawl:bilibili": "node src/crawl-bilibili.mjs",
+    "collect:daily": "node src/collect-daily.mjs",
+    "repair:content-types": "node src/repair-content-types.mjs",
+    "doctor": "node src/doctor.mjs",
+    "ui": "node src/server.mjs",
+    "test": "node --test"
   },
   "dependencies": {
-    "playwright": "^1.52.0"
+    "dotenv": "17.4.2",
+    "node-cron": "4.2.1",
+    "playwright": "1.59.1"
   }
 }

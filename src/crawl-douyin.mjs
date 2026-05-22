@@ -2,14 +2,31 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { chromiumLaunchOptions, resolveHeadless } from "./browser-env.mjs";
-import { classifyTags } from "./tag-rules.mjs";
+import { formatDate as formatDateInTimeZone, parsePublishedDateText } from "./date-utils.mjs";
+import { extractDouyinApiDetail, extractDouyinTagsFromSources, extractDouyinTitle } from "./douyin-detail-text.mjs";
+import { douyinProfileIdsMatch, extractPrimaryDouyinAuthorProfileUrl } from "./douyin-profile-guard.mjs";
+import { classifyContentType } from "./content-classifier.mjs";
+import { spreadsheetSafeText } from "./spreadsheet-safe.mjs";
+import {
+  DetailCache,
+  createCrawlAudit,
+  installConservativeResourceBlocker,
+  logAuditSummary,
+  resolveCrawlMode,
+  shouldCopyDouyinShare,
+  shouldInspectDetailByPublishedAt,
+  shouldRefreshDetailCache,
+  shouldUseDetailCache
+} from "./crawl-runtime.mjs";
 
 const ROOT = process.cwd();
 const OUTPUT_DIR = path.join(ROOT, "output");
 const USER_DATA_DIR = path.join(ROOT, ".douyin-profile");
 const OPTIONS = parseArgs(process.argv.slice(2));
-const TODAY = parseDateInput(OPTIONS.until || process.env.UNTIL || formatDate(new Date()), "结束日期");
+const CRAWL_MODE = resolveCrawlMode(OPTIONS);
+const TODAY = parseDateInput(OPTIONS.until || process.env.UNTIL || formatDateInTimeZone(new Date()), "结束日期");
 const SINCE = parseDateInput(OPTIONS.since || process.env.SINCE || "2026-04-15", "起始日期");
+const REFERENCE_DATE = parseDateInput(OPTIONS.referenceDate || process.env.REFERENCE_DATE || formatDateInTimeZone(new Date()), "相对时间参考日期");
 const MAX_SCROLLS_PER_ACCOUNT = Number(process.env.MAX_SCROLLS_PER_ACCOUNT || 18);
 const MAX_DETAIL_PAGES = Number(process.env.MAX_DETAIL_PAGES || 120);
 const OLD_ITEM_STOP_AFTER = Number(process.env.OLD_ITEM_STOP_AFTER || 4);
@@ -18,15 +35,15 @@ const DETAIL_READ_DELAY = parseDelayRange(process.env.DOUYIN_DETAIL_READ_DELAY |
 const DETAIL_GAP_DELAY = parseDelayRange(process.env.DOUYIN_DETAIL_GAP_DELAY || "2000-5000");
 const SCROLL_DELAY = parseDelayRange(process.env.DOUYIN_SCROLL_DELAY || "2000-4000");
 const HEADLESS = resolveHeadless();
+const DOUYIN_DETAIL_CACHE_VERSION = 3;
 
 const DEFAULT_ACCOUNTS = [
   { name: "同花顺投资", url: "https://www.douyin.com/user/MS4wLjABAAAArf6v6Z48Pma-bIrz00wVCu76ioePN0vKzHAM_w9DN8AOkLekEk13Ay8_L-74BBB8" },
-  { name: "同花顺财富", url: "https://www.douyin.com/user/MS4wLjABAAAAffWkqfj5JINgA9xCh5-FKaNW5qY2huDbccgDgQho8B8" },
   { name: "同花顺股民社区", url: "https://www.douyin.com/user/MS4wLjABAAAAzuAZbgu03QhyuhKxMJGwrG0pnvDNfstYkT5ZCNGD-0U" },
+  { name: "同花顺财富", url: "https://www.douyin.com/user/MS4wLjABAAAAffWkqfj5JINgA9xCh5-FKaNW5qY2huDbccgDgQho8B8" },
   { name: "同花顺财经", url: "https://www.douyin.com/user/MS4wLjABAAAAUre0Jlqe0K5psIWsDhGc8A9TKiKgfYkI0uCnryZ-9U3SeKkyAM7hSqhohItj8okF" },
-  { name: "同花顺期货通", url: "https://www.douyin.com/user/MS4wLjABAAAAxr3bk2-4lsUB0XOErXDXFKIocqd2wOExCTAuRwQ19Vg" },
   { name: "同花顺问财", url: "https://www.douyin.com/user/MS4wLjABAAAA6JdBqgkVwTEgEeOHSWLxaDZ2II-eG3Jm1LpzZiqrRu7_kE2iDCZdYt1jqpVAawMa" },
-  { name: "喵懂投资", url: "https://www.douyin.com/user/MS4wLjABAAAAbQ3f4IDVIZGwBu6XueIDoaQzhD0YrZ0XDVwn1PwjceMVdWaBDNePaOARgR3kW4Lr" }
+  { name: "同花顺期货通", url: "https://www.douyin.com/user/MS4wLjABAAAAxr3bk2-4lsUB0XOErXDXFKIocqd2wOExCTAuRwQ19Vg" }
 ];
 
 async function main() {
@@ -36,6 +53,8 @@ async function main() {
 
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
   console.log(`抖音爬取时间范围：${formatDate(SINCE)} 至 ${formatDate(TODAY)}`);
+  console.log(`抖音相对时间解析基准：${formatDate(REFERENCE_DATE)}`);
+  console.log(`抖音采集模式：${modeLabel(CRAWL_MODE)}`);
 
   const accounts = await loadAccounts();
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
@@ -43,7 +62,12 @@ async function main() {
     headless: HEADLESS,
     viewport: { width: 1440, height: 1000 },
     locale: "zh-CN",
-    timezoneId: "Asia/Shanghai"
+      timezoneId: "Asia/Shanghai"
+  });
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "https://www.douyin.com" }).catch(() => {});
+  const resourceBlocker = await installConservativeResourceBlocker(context, {
+    mode: CRAWL_MODE,
+    label: "抖音轻量页面模式"
   });
 
   const listPage = await context.newPage();
@@ -52,6 +76,14 @@ async function main() {
   detailPage.setDefaultTimeout(20_000);
 
   const rows = [];
+  const audit = createCrawlAudit("douyin");
+  const detailCache = new DetailCache({
+    root: ROOT,
+    platformId: "douyin",
+    enabled: shouldUseDetailCache({ mode: CRAWL_MODE }),
+    refresh: shouldRefreshDetailCache()
+  });
+  const copyShare = shouldCopyDouyinShare({ mode: CRAWL_MODE });
   for (const account of accounts) {
     console.log(`\n==> 处理抖音账号：${account.name}`);
     if (!account.url) {
@@ -63,14 +95,20 @@ async function main() {
       listPage,
       detailPage,
       accountName: account.name,
-      profileUrl: account.url
+      profileUrl: account.url,
+      audit: audit.account(account.name),
+      detailCache,
+      resourceBlocker,
+      copyShare
     });
     rows.push(...accountRows);
     console.log(`抖音账号完成：${account.name}，命中 ${accountRows.length} 条`);
   }
 
+  logAuditSummary(audit);
+  await resourceBlocker.close();
   await context.close();
-  await writeOutputs(rows);
+  await writeOutputs(rows, { audit: audit.toJSON(), mode: CRAWL_MODE });
   console.log(`\n抖音完成：导出 ${rows.length} 条`);
 }
 
@@ -92,7 +130,7 @@ async function loadAccounts() {
   }
 }
 
-async function crawlAccountRecentFirst({ listPage, detailPage, accountName, profileUrl }) {
+async function crawlAccountRecentFirst({ listPage, detailPage, accountName, profileUrl, audit, detailCache, resourceBlocker, copyShare }) {
   await listPage.goto(profileUrl, { waitUntil: "domcontentloaded" });
   await listPage.waitForLoadState("domcontentloaded").catch(() => {});
   await listPage.waitForTimeout(3500);
@@ -108,9 +146,16 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
   let oldItemRounds = 0;
   let checked = 0;
   let hasInRangeItem = false;
+  let stopped = false;
+  const stop = (reason) => {
+    if (!stopped) {
+      audit?.stop(reason);
+      stopped = true;
+    }
+  };
 
   for (let i = 0; i < MAX_SCROLLS_PER_ACCOUNT; i += 1) {
-    const links = await getPublishedItems(listPage);
+    const links = await getPublishedItemsWithFallback(listPage, { resourceBlocker });
     const newLinks = links.filter((link) => !seen.has(link.id));
     console.log(`页面作品链接：${links.length} 条，新作品：${newLinks.length} 条`);
 
@@ -125,22 +170,60 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
     stableRounds = newLinks.length === 0 ? stableRounds + 1 : 0;
 
     for (const link of newLinks) {
+      seen.add(link.id);
+      const prefilter = shouldInspectDetailByPublishedAt({
+        publishedAt: link.publishedAt,
+        since: SINCE,
+        until: TODAY
+      });
+      if (!prefilter.inspect) {
+        audit?.recordSkipped(prefilter.reason);
+        if (prefilter.reason === "before-since") {
+          oldItemRounds += 1;
+          console.log(`列表时间边界：早于开始日期，跳过详情页：${accountName} ${link.publishedAt} ${link.exportUrl}`);
+          if ((hasInRangeItem || seen.size >= MIN_CHECK_BEFORE_STOP) && oldItemRounds >= OLD_ITEM_STOP_AFTER) {
+            stop("old-boundary");
+            console.log(`连续 ${OLD_ITEM_STOP_AFTER} 条早于起始日期，停止继续下翻：${accountName}`);
+            return rows;
+          }
+        } else {
+          console.log(`列表时间边界：晚于结束日期，跳过详情页：${accountName} ${link.publishedAt} ${link.exportUrl}`);
+        }
+        continue;
+      }
+      if (prefilter.reason === "unknown-date") audit?.recordUnknownDate();
+
       if (checked >= MAX_DETAIL_PAGES) {
+        stop("detail-limit");
         console.log(`已达到详情页检查上限：${MAX_DETAIL_PAGES}`);
         return rows;
       }
 
-      seen.add(link.id);
       checked += 1;
+      audit?.recordChecked();
 
-      await waitRandom(detailPage, DETAIL_GAP_DELAY, "详情页间隔");
-      const detail = await scrapeItemDetail(detailPage, link.detailUrl).catch((error) => {
-        console.warn(`打开抖音作品失败，跳过：${link.exportUrl}`);
-        console.warn(error.message || String(error));
-        return { tags: "", publishedAt: null, itemUrl: link.exportUrl, failed: true };
-      });
+      let detail = restoreDouyinDetailFromCache(await detailCache.get(link.id));
+      if (detail) {
+        audit?.recordCacheHit();
+        console.log(`抖音详情缓存命中：${accountName} ${link.exportUrl}`);
+      } else {
+        await waitRandom(detailPage, DETAIL_GAP_DELAY, "详情页间隔");
+        detail = await scrapeItemDetail(detailPage, link.detailUrl, { resourceBlocker, copyShare }).catch((error) => {
+          console.warn(`打开抖音作品失败，跳过：${link.exportUrl}`);
+          console.warn(error.message || String(error));
+          return { tags: "", publishedAt: null, itemUrl: link.exportUrl, failed: true };
+        });
+        if (isCacheableDouyinDetail(detail)) {
+          await detailCache.set(link.id, serializeDouyinDetailForCache(detail));
+        }
+      }
 
       if (detail.failed) {
+        continue;
+      }
+
+      if (!douyinProfileIdsMatch(profileUrl, detail.authorProfileUrl)) {
+        console.warn(`跳过非当前账号作品：${accountName} expected=${profileUrl} actual=${detail.authorProfileUrl || "未识别"} link=${detail.itemUrl || link.exportUrl}`);
         continue;
       }
 
@@ -155,8 +238,9 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
       const publishedAt = formatDate(detail.publishedAt);
       if (detail.publishedAt < SINCE) {
         oldItemRounds += 1;
-        console.log(`已到较早作品：${accountName} ${publishedAt} ${detail.itemUrl || link.exportUrl}`);
+        console.log(`边界检查：发现早于开始日期的作品，不导出：${accountName} ${publishedAt} ${detail.itemUrl || link.exportUrl}`);
         if ((hasInRangeItem || checked >= MIN_CHECK_BEFORE_STOP) && oldItemRounds >= OLD_ITEM_STOP_AFTER) {
+          stop("old-boundary");
           console.log(`连续 ${OLD_ITEM_STOP_AFTER} 条早于起始日期，停止继续下翻：${accountName}`);
           return rows;
         }
@@ -171,23 +255,52 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
       }
 
       hasInRangeItem = true;
+      audit?.recordHit();
+      const classification = await classifyContentType({
+        platformId: "douyin",
+        accountName,
+        title: detail.title || "",
+        tags: detail.tags,
+        text: detail.shareText || ""
+      });
       rows.push({
         accountName,
         publishedAt,
         itemUrl: detail.itemUrl || link.exportUrl,
+        shareText: detail.shareText || "",
+        title: detail.title || "",
         tags: detail.tags,
-        contentType: classifyTags(detail.tags)
+        contentType: classification.contentType,
+        contentTypeReview: classification.contentTypeReview
       });
       console.log(`抖音命中：${accountName} ${publishedAt} ${detail.itemUrl || link.exportUrl}`);
     }
 
-    if (stableRounds >= 4 && links.length > 0) break;
+    if (stableRounds >= 4 && links.length > 0) {
+      stop("stable-rounds");
+      break;
+    }
 
     await listPage.mouse.wheel(0, 1600);
     await waitRandom(listPage, SCROLL_DELAY, "下翻停留");
   }
 
+  stop("scroll-limit");
   return rows;
+}
+
+async function getPublishedItemsWithFallback(listPage, { resourceBlocker } = {}) {
+  let links = await getPublishedItems(listPage);
+  if (links.length > 0 || !resourceBlocker?.enabled) return links;
+
+  console.log("抖音列表页未读到作品，关闭轻量页面模式重试一次。");
+  links = await resourceBlocker.disableTemporarily(async () => {
+    await listPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await listPage.waitForLoadState("domcontentloaded").catch(() => {});
+    await listPage.waitForTimeout(1200);
+    return getPublishedItems(listPage);
+  });
+  return links;
 }
 
 async function getPublishedItems(page) {
@@ -214,13 +327,62 @@ async function getPublishedItems(page) {
   return [...byId.values()];
 }
 
-async function scrapeItemDetail(page, itemUrl) {
+async function scrapeItemDetail(page, itemUrl, { resourceBlocker, copyShare = false } = {}) {
+  const detail = await scrapeItemDetailOnce(page, itemUrl, { copyShare });
+  if (shouldRetryDouyinDetailUnblocked(detail) && resourceBlocker?.enabled) {
+    console.log("抖音详情页关键字段未读到，关闭轻量页面模式重试一次。");
+    return resourceBlocker.disableTemporarily(() => scrapeItemDetailOnce(page, itemUrl, { copyShare }));
+  }
+  return detail;
+}
+
+async function scrapeItemDetailOnce(page, itemUrl, { copyShare = false } = {}) {
+  const apiDetailPromise = waitForDouyinAwemeDetail(page, itemUrl);
   await page.goto(itemUrl, { waitUntil: "domcontentloaded" });
   await waitForDetailDateText(page);
   await waitRandom(page, DETAIL_READ_DELAY, "详情页停留");
   const detail = await scrapeItemDetailFromPage(page);
+  const apiDetail = await apiDetailPromise;
+  if (apiDetail) {
+    detail.title = detail.title || apiDetail.title;
+    detail.tags = detail.tags || apiDetail.tags;
+    detail.publishedAt = apiDetail.publishedAt || detail.publishedAt;
+    detail.authorProfileUrl = apiDetail.authorProfileUrl || detail.authorProfileUrl;
+  }
   detail.itemUrl = normalizeClickedItemUrl(page.url()) || itemUrl;
+  detail.shareText = (copyShare || !detail.tags) ? await tryReadShareText(page) : "";
+  if (!detail.tags && detail.shareText) {
+    detail.tags = extractDouyinTagsFromSources({
+      itemText: detail.itemText,
+      titleText: detail.titleText,
+      shareText: detail.shareText
+    });
+  }
+  detail.title = detail.title || extractDouyinTitle({
+    itemText: detail.itemText,
+    titleText: detail.titleText,
+    shareText: detail.shareText
+  });
   return detail;
+}
+
+function waitForDouyinAwemeDetail(page, itemUrl) {
+  const itemId = normalizeItemUrl(itemUrl)?.id || "";
+  if (!itemId) return Promise.resolve(null);
+
+  return page.waitForResponse((response) => {
+    try {
+      const url = new URL(response.url());
+      return url.pathname.includes("/aweme/v1/web/aweme/detail/")
+        && url.searchParams.get("aweme_id") === itemId
+        && response.status() === 200;
+    } catch {
+      return false;
+    }
+  }, { timeout: 15_000 })
+    .then((response) => response.json())
+    .then((json) => extractDouyinApiDetail(json))
+    .catch(() => null);
 }
 
 async function scrapeItemDetailFromPage(page) {
@@ -231,11 +393,27 @@ async function scrapeItemDetailFromPage(page) {
 
   const itemText = await readCurrentItemText(page);
   const titleText = await page.title().catch(() => "");
-  const tagSourceText = itemText || titleText || bodyText;
   const dateSourceText = itemText || bodyText;
-  const tags = extractTags(tagSourceText);
+  const tags = extractDouyinTagsFromSources({ itemText, titleText });
+  const title = extractDouyinTitle({ itemText, titleText });
   const publishedAt = extractPublishedAtFromText(dateSourceText);
-  return { tags, publishedAt, dateCandidates: extractDateCandidateLines(dateSourceText) };
+  const authorProfileUrl = await readPrimaryAuthorProfileUrl(page);
+  return {
+    title,
+    tags,
+    publishedAt,
+    authorProfileUrl,
+    itemText,
+    titleText,
+    dateCandidates: extractDateCandidateLines(dateSourceText)
+  };
+}
+
+async function readPrimaryAuthorProfileUrl(page) {
+  const hrefs = await page.locator("a[href]").evaluateAll((anchors) => {
+    return anchors.map((anchor) => anchor.href || "").filter(Boolean);
+  }).catch(() => []);
+  return extractPrimaryDouyinAuthorProfileUrl(hrefs);
 }
 
 async function waitForDetailDateText(page) {
@@ -272,6 +450,58 @@ async function readCurrentItemText(page) {
     });
 
     if (usable) return usable;
+  }
+
+  return "";
+}
+
+async function tryReadShareText(page) {
+  const previousClipboard = await page.evaluate(async () => {
+    try {
+      return await navigator.clipboard.readText();
+    } catch {
+      return "";
+    }
+  }).catch(() => "");
+
+  const shareTriggers = [
+    page.getByText(/^分享$/).first(),
+    page.locator('[aria-label*="分享"]').first(),
+    page.locator('button:has-text("分享")').first()
+  ];
+
+  for (const trigger of shareTriggers) {
+    try {
+      await trigger.click({ timeout: 1200 });
+      await page.waitForTimeout(800);
+      break;
+    } catch {
+      // Try the next visible share affordance.
+    }
+  }
+
+  const copyTriggers = [
+    page.getByText(/复制链接|复制口令|复制分享/).first(),
+    page.locator('button:has-text("复制")').first()
+  ];
+
+  for (const trigger of copyTriggers) {
+    try {
+      await trigger.click({ timeout: 1200 });
+      await page.waitForTimeout(500);
+      const clipboard = await page.evaluate(async () => {
+        try {
+          return await navigator.clipboard.readText();
+        } catch {
+          return "";
+        }
+      });
+      if (clipboard && clipboard !== previousClipboard && /douyin\.com|Dou音|抖音/i.test(clipboard)) {
+        return clipboard.trim();
+      }
+    } catch {
+      // Share text is best-effort; the caller falls back to the detail URL.
+    }
   }
 
   return "";
@@ -326,65 +556,26 @@ function extractDateCandidateLines(text) {
   return lines.slice(0, 8).join(" | ");
 }
 
-function extractTags(text) {
-  const matches = text.match(/#[\p{Script=Han}\p{Letter}\p{Number}_-]+/gu) || [];
-  return [...new Set(matches)].join(" ");
-}
-
 function parsePublishedAt(text) {
-  const normalized = String(text || "").replace(/\s+/g, " ");
-
-  const fullDate = normalized.match(/(?:发布时间|发布于)?[:：]?\s*(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\s|$)/);
-  if (fullDate) return parseDateOnly(`${fullDate[1]}-${pad(fullDate[2])}-${pad(fullDate[3])}`);
-
-  const cnDate = normalized.match(/(20\d{2})年(\d{1,2})月(\d{1,2})日/);
-  if (cnDate) return parseDateOnly(`${cnDate[1]}-${pad(cnDate[2])}-${pad(cnDate[3])}`);
-
-  const cnMonthDate = normalized.match(/(\d{1,2})月(\d{1,2})日/);
-  if (cnMonthDate) return parseDateOnly(`${TODAY.getFullYear()}-${pad(cnMonthDate[1])}-${pad(cnMonthDate[2])}`);
-
-  const monthDate = normalized.match(/(?:发布时间|发布于)?[:：]?\s*(\d{1,2})[./-](\d{1,2})(?:\s+\d{1,2}:?\d{0,2})?(?:\s|$)/);
-  if (monthDate) return parseDateOnly(`${TODAY.getFullYear()}-${pad(monthDate[1])}-${pad(monthDate[2])}`);
-
-  if (/今天|刚刚|\d+\s*分钟前|\d+\s*小时前/.test(normalized)) {
-    return cloneDate(TODAY);
-  }
-
-  if (/昨天/.test(normalized)) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - 1);
-    return date;
-  }
-
-  const daysAgo = normalized.match(/(\d+)\s*天前/);
-  if (daysAgo) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - Number(daysAgo[1]));
-    return date;
-  }
-
-  const weeksAgo = normalized.match(/(\d+)\s*周前/);
-  if (weeksAgo) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - Number(weeksAgo[1]) * 7);
-    return date;
-  }
-
-  return null;
+  const dateString = parsePublishedDateText(text, formatDate(REFERENCE_DATE));
+  return dateString ? parseDateOnly(dateString) : null;
 }
 
-async function writeOutputs(rows) {
+async function writeOutputs(rows, { audit = null, mode = "conservative" } = {}) {
   const baseName = `douyin_notes_${formatDate(SINCE)}_to_${formatDate(TODAY)}`;
   const xlsPath = path.join(OUTPUT_DIR, `${baseName}.xls`);
   const csvPath = path.join(OUTPUT_DIR, `${baseName}.csv`);
-  const headers = ["账号名称", "发布时间", "作品链接", "作品分类", "TAG词"];
+  const jsonPath = path.join(OUTPUT_DIR, `${baseName}.json`);
+  const headers = ["账号名称", "发布时间", "作品链接", "标题", "作品分类", "内容类型标签审核", "TAG词"];
 
   const sheetRows = rows.map((row) => ({
-    "账号名称": row.accountName,
+    "账号名称": spreadsheetSafeText(row.accountName),
     "发布时间": row.publishedAt,
     "作品链接": row.itemUrl,
-    "作品分类": row.contentType,
-    "TAG词": row.tags || ""
+    "标题": spreadsheetSafeText(row.title || ""),
+    "作品分类": spreadsheetSafeText(row.contentType),
+    "内容类型标签审核": spreadsheetSafeText(row.contentTypeReview || ""),
+    "TAG词": spreadsheetSafeText(row.tags || "")
   }));
 
   await fs.writeFile(xlsPath, buildExcelXml(headers, sheetRows), "utf8");
@@ -394,13 +585,33 @@ async function writeOutputs(rows) {
     ...sheetRows.map((row) => headers.map((header) => csvEscape(row[header] || "")).join(","))
   ].join("\n");
   await fs.writeFile(csvPath, csv, "utf8");
+  await fs.writeFile(jsonPath, JSON.stringify({
+    platform: "douyin",
+    mode,
+    since: formatDate(SINCE),
+    until: formatDate(TODAY),
+    audit,
+    items: rows.map((row) => ({
+      platform: "douyin",
+      accountName: row.accountName,
+      publishedAt: row.publishedAt,
+      link: row.itemUrl,
+      itemUrl: row.itemUrl,
+      shareText: row.shareText || "",
+      title: row.title || "",
+      tags: row.tags || "",
+      contentType: row.contentType || "无",
+      contentTypeReview: row.contentTypeReview || "需审核"
+    }))
+  }, null, 2), "utf8");
 
   console.log(`XLS ：${xlsPath}`);
   console.log(`CSV ：${csvPath}`);
+  console.log(`JSON：${jsonPath}`);
 }
 
 function buildExcelXml(headers, rows) {
-  const widths = [120, 90, 520, 100, 320];
+  const widths = [120, 90, 520, 360, 100, 120, 320];
   const headerCells = headers
     .map((header) => `<Cell ss:StyleID="header"><Data ss:Type="String">${xmlEscape(header)}</Data></Cell>`)
     .join("");
@@ -502,6 +713,24 @@ function parseArgs(args) {
       options.until = arg.slice("--until=".length);
       continue;
     }
+    if (arg === "--reference-date") {
+      options.referenceDate = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--reference-date=")) {
+      options.referenceDate = arg.slice("--reference-date=".length);
+      continue;
+    }
+    if (arg === "--mode") {
+      options.mode = args[i + 1];
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      options.mode = arg.slice("--mode=".length);
+      continue;
+    }
     if (!options.since && !arg.startsWith("-")) {
       options.since = arg;
     }
@@ -580,6 +809,47 @@ async function waitRandom(page, range, label = "停留") {
 function randomBetween(min, max) {
   if (max <= min) return min;
   return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+function restoreDouyinDetailFromCache(cached) {
+  if (!cached) return null;
+  if (cached.cacheVersion !== DOUYIN_DETAIL_CACHE_VERSION) return null;
+  return {
+    tags: cached.tags || "",
+    publishedAt: cached.publishedAt ? parseDateOnly(cached.publishedAt) : null,
+    itemUrl: cached.itemUrl || "",
+    shareText: cached.shareText || "",
+    title: cached.title || "",
+    authorProfileUrl: cached.authorProfileUrl || "",
+    contentType: cached.contentType || "",
+    contentTypeReview: cached.contentTypeReview || ""
+  };
+}
+
+function serializeDouyinDetailForCache(detail) {
+  return {
+    cacheVersion: DOUYIN_DETAIL_CACHE_VERSION,
+    tags: detail.tags || "",
+    publishedAt: detail.publishedAt ? formatDate(detail.publishedAt) : "",
+    itemUrl: detail.itemUrl || "",
+    shareText: detail.shareText || "",
+    title: detail.title || "",
+    authorProfileUrl: detail.authorProfileUrl || "",
+    contentType: detail.contentType || "",
+    contentTypeReview: detail.contentTypeReview || ""
+  };
+}
+
+function isCacheableDouyinDetail(detail) {
+  return Boolean(detail && !detail.failed && detail.publishedAt && detail.authorProfileUrl);
+}
+
+function shouldRetryDouyinDetailUnblocked(detail) {
+  return Boolean(!detail?.publishedAt || !detail?.authorProfileUrl);
+}
+
+function modeLabel(mode) {
+  return mode === "legacy" ? "兼容旧模式" : "保守提速";
 }
 
 main().catch((error) => {
