@@ -11,8 +11,9 @@ if %ERRORLEVEL% EQU 0 (
   exit /b 0
 )
 
-echo 正在启动小红书爬取面板...
+echo 正在启动作品采集面板（本机模式）...
 echo 打开后请不要关闭这个窗口；关闭窗口或按 Ctrl+C 会停止面板。
+echo 本机访问地址：%URL%
 echo.
 
 start "" powershell -NoProfile -Command "Start-Sleep -Seconds 2; Start-Process '%URL%'"

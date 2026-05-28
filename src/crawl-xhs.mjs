@@ -2,31 +2,51 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { chromiumLaunchOptions, resolveHeadless } from "./browser-env.mjs";
-import { classifyTags } from "./tag-rules.mjs";
+import { formatDate as formatDateInTimeZone } from "./date-utils.mjs";
+import { classifyContentType } from "./content-classifier.mjs";
+import { buildXhsExploreUrl, extractXhsNoteId, normalizeXhsContentLink } from "./link-utils.mjs";
+import { spreadsheetSafeText } from "./spreadsheet-safe.mjs";
+import { isXhsProfileUrl, loadXhsAccounts, selectXhsAccounts } from "./xhs-accounts.mjs";
+import { buildXhsOutputBaseName } from "./xhs-output-names.mjs";
+import {
+  XHS_DETAIL_CACHE_VERSION,
+  createXhsDetailRiskGuard,
+  parseXhsDetailPublishedAt,
+  resolveXhsPublishedAtEntry,
+  resolveXhsStatePublishedAt,
+  restoreXhsDetailFromCache,
+  serializeXhsDetailForCache
+} from "./xhs-published-date.mjs";
+import {
+  DetailCache,
+  createCrawlAudit,
+  comparePublishedAtToDateRange,
+  dateKey,
+  installConservativeResourceBlocker,
+  logAuditSummary,
+  resolveCrawlMode,
+  shouldInspectDetailByPublishedAt,
+  shouldRefreshDetailCache,
+  shouldUseDetailCache
+} from "./crawl-runtime.mjs";
 
 const ROOT = process.cwd();
 const OUTPUT_DIR = path.join(ROOT, "output");
 const USER_DATA_DIR = path.join(ROOT, ".xhs-profile");
 const OPTIONS = parseArgs(process.argv.slice(2));
-const TODAY = parseDateInput(OPTIONS.until || process.env.UNTIL || formatDate(new Date()), "结束日期");
+const CRAWL_MODE = resolveCrawlMode(OPTIONS);
+const TODAY = parseDateInput(OPTIONS.until || process.env.UNTIL || formatDateInTimeZone(new Date()), "结束日期");
 const SINCE = parseDateInput(OPTIONS.since || process.env.SINCE || "2026-04-15", "起始日期");
+const REFERENCE_DATE = parseDateInput(OPTIONS.referenceDate || process.env.REFERENCE_DATE || formatDateInTimeZone(new Date()), "相对时间参考日期");
 const MAX_SCROLLS_PER_ACCOUNT = Number(process.env.MAX_SCROLLS_PER_ACCOUNT || 18);
 const MAX_DETAIL_PAGES = Number(process.env.MAX_DETAIL_PAGES || 120);
 const OLD_NOTE_STOP_AFTER = Number(process.env.OLD_NOTE_STOP_AFTER || 4);
 const MIN_CHECK_BEFORE_STOP = Number(process.env.MIN_CHECK_BEFORE_STOP || 8);
 const DETAIL_READ_DELAY = parseDelayRange(process.env.XHS_DETAIL_READ_DELAY || "2000-5000");
 const DETAIL_GAP_DELAY = parseDelayRange(process.env.XHS_DETAIL_GAP_DELAY || "1500-4000");
+const BLOCKED_DETAIL_STOP_AFTER = Number(process.env.XHS_BLOCKED_DETAIL_STOP_AFTER || 2);
 const SCROLL_DELAY = parseDelayRange(process.env.XHS_SCROLL_DELAY || "1800-3500");
 const HEADLESS = resolveHeadless();
-
-const DEFAULT_ACCOUNTS = [
-  { name: "同花顺投资", url: "" },
-  { name: "同花顺股民社区", url: "" },
-  { name: "同顺财经", url: "" },
-  { name: "同花顺新手福利官", url: "" },
-  { name: "同花顺理财", url: "" },
-  { name: "喵懂投资", url: "" }
-];
 
 async function main() {
   if (SINCE > TODAY) {
@@ -35,14 +55,26 @@ async function main() {
 
   await fs.mkdir(OUTPUT_DIR, { recursive: true });
   console.log(`爬取时间范围：${formatDate(SINCE)} 至 ${formatDate(TODAY)}`);
+  console.log(`相对时间解析基准：${formatDate(REFERENCE_DATE)}`);
+  console.log(`采集模式：${modeLabel(CRAWL_MODE)}`);
 
-  const accounts = await loadAccounts();
+  const accountFilter = String(OPTIONS.account || process.env.XHS_ACCOUNT || "").trim();
+  const accounts = selectXhsAccounts(await loadXhsAccounts(ROOT), accountFilter);
+  const outputAccountName = accountFilter ? accounts[0]?.name || accountFilter : "";
+  if (accountFilter) {
+    console.log(`账号过滤：${accountFilter}，匹配 ${accounts.map((account) => account.name).join("、")}`);
+  }
+
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     ...chromiumLaunchOptions(),
     headless: HEADLESS,
     viewport: { width: 1440, height: 1000 },
     locale: "zh-CN",
-    timezoneId: "Asia/Shanghai"
+      timezoneId: "Asia/Shanghai"
+  });
+  const resourceBlocker = await installConservativeResourceBlocker(context, {
+    mode: CRAWL_MODE,
+    label: "小红书轻量页面模式"
   });
 
   const listPage = await context.newPage();
@@ -51,10 +83,17 @@ async function main() {
   detailPage.setDefaultTimeout(20_000);
 
   const rows = [];
+  const audit = createCrawlAudit("xhs");
+  const detailCache = new DetailCache({
+    root: ROOT,
+    platformId: "xhs",
+    enabled: shouldUseDetailCache({ mode: CRAWL_MODE }),
+    refresh: shouldRefreshDetailCache()
+  });
 
   for (const account of accounts) {
     console.log(`\n==> 处理账号：${account.name}`);
-    const profileUrl = account.url || (await findProfileUrl(listPage, account.name));
+    const profileUrl = account.url || (await findProfileUrl(listPage, account.name, account.aliases));
 
     if (!profileUrl) {
       console.warn(`未找到账号主页：${account.name}`);
@@ -66,63 +105,57 @@ async function main() {
       listPage,
       detailPage,
       accountName: account.name,
-      profileUrl
+      profileUrl,
+      audit: audit.account(account.name),
+      detailCache,
+      resourceBlocker
     });
     rows.push(...accountRows);
     console.log(`账号完成：${account.name}，命中 ${accountRows.length} 条`);
   }
 
+  logAuditSummary(audit);
+  await resourceBlocker.close();
   await context.close();
-  await writeOutputs(rows);
+  await writeOutputs(rows, { accountName: outputAccountName, audit: audit.toJSON(), mode: CRAWL_MODE });
   console.log(`\n完成：导出 ${rows.length} 条`);
 }
 
-async function loadAccounts() {
-  const accountPath = path.join(ROOT, "accounts.json");
-  try {
-    const text = await fs.readFile(accountPath, "utf8");
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed)) {
-      throw new Error("accounts.json must be an array");
+async function findProfileUrl(page, accountName, aliases = []) {
+  const names = [accountName, ...aliases].filter(Boolean);
+
+  for (const name of names) {
+    const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(name)}&type=user`;
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(2500);
+
+    const exactText = page.getByText(name, { exact: true }).first();
+    try {
+      await exactText.scrollIntoViewIfNeeded();
+      await exactText.click({ timeout: 5000 });
+      await page.waitForLoadState("domcontentloaded");
+      await page.waitForTimeout(1500);
+      const url = page.url();
+      if (isXhsProfileUrl(url)) return url;
+    } catch {
+      // Fall through to DOM link scan.
     }
-    return parsed.map((item) => ({
-      name: String(item.name || "").trim(),
-      url: normalizeProfileUrl(String(item.url || "").trim())
-    })).filter((item) => item.name);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    return DEFAULT_ACCOUNTS;
-  }
-}
 
-async function findProfileUrl(page, accountName) {
-  const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(accountName)}&type=user`;
-  await page.goto(searchUrl, { waitUntil: "domcontentloaded" });
-  await page.waitForTimeout(2500);
+    const links = await page.locator("a[href]").evaluateAll((anchors, searchNames) => {
+      return anchors
+        .map((a) => ({ href: a.href, text: a.textContent || "" }))
+        .filter((a) => searchNames.some((searchName) => a.text.includes(searchName)) || /\/user\/profile\//.test(a.href))
+        .map((a) => a.href);
+    }, names);
 
-  const exactText = page.getByText(accountName, { exact: true }).first();
-  try {
-    await exactText.scrollIntoViewIfNeeded();
-    await exactText.click({ timeout: 5000 });
-    await page.waitForLoadState("domcontentloaded");
-    await page.waitForTimeout(1500);
-    const url = page.url();
-    if (isProfileUrl(url)) return url;
-  } catch {
-    // Fall through to DOM link scan.
+    const profileUrl = links.find(isXhsProfileUrl);
+    if (profileUrl) return profileUrl;
   }
 
-  const links = await page.locator("a[href]").evaluateAll((anchors, name) => {
-    return anchors
-      .map((a) => ({ href: a.href, text: a.textContent || "" }))
-      .filter((a) => a.text.includes(name) || /\/user\/profile\//.test(a.href))
-      .map((a) => a.href);
-  }, accountName);
-
-  return links.find(isProfileUrl) || "";
+  return "";
 }
 
-async function crawlAccountRecentFirst({ listPage, detailPage, accountName, profileUrl }) {
+async function crawlAccountRecentFirst({ listPage, detailPage, accountName, profileUrl, audit, detailCache, resourceBlocker }) {
   await listPage.goto(profileUrl, { waitUntil: "domcontentloaded" });
   await waitForProfileNotes(listPage);
   if (await isLoginRequired(listPage)) {
@@ -135,9 +168,17 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
   let oldNoteRounds = 0;
   let checked = 0;
   let hasInRangeNote = false;
+  let stopped = false;
+  const detailRiskGuard = createXhsDetailRiskGuard({ stopAfter: BLOCKED_DETAIL_STOP_AFTER });
+  const stop = (reason) => {
+    if (!stopped) {
+      audit?.stop(reason);
+      stopped = true;
+    }
+  };
 
   for (let i = 0; i < MAX_SCROLLS_PER_ACCOUNT; i += 1) {
-    const stateLinks = await getPublishedNotesFromState(listPage);
+    const stateLinks = await getProfileStateLinks(listPage, { resourceBlocker });
     const newLinks = stateLinks.filter((link) => !seen.has(link.id));
     console.log(`页面状态发布作品：${stateLinks.length} 条，新作品：${newLinks.length} 条`);
     if (stateLinks.length === 0) {
@@ -155,31 +196,84 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
     }
 
     for (const link of newLinks) {
+      seen.add(link.id);
+      const prefilter = shouldInspectDetailByPublishedAt({
+        publishedAt: link.statePublishedAt,
+        since: SINCE,
+        until: TODAY
+      });
+      if (!prefilter.inspect) {
+        audit?.recordSkipped(prefilter.reason);
+        const publishedAt = formatDate(link.statePublishedAt);
+        if (prefilter.reason === "before-since") {
+          oldNoteRounds += 1;
+          console.log(`列表时间边界：早于开始日期，跳过详情页：${accountName} ${publishedAt} ${link.exportUrl}`);
+          if ((hasInRangeNote || seen.size >= MIN_CHECK_BEFORE_STOP) && oldNoteRounds >= OLD_NOTE_STOP_AFTER) {
+            stop("old-boundary");
+            console.log(`连续 ${OLD_NOTE_STOP_AFTER} 条早于起始日期，停止继续下翻：${accountName}`);
+            return rows;
+          }
+        } else {
+          console.log(`列表时间边界：晚于结束日期，跳过详情页：${accountName} ${publishedAt} ${link.exportUrl}`);
+        }
+        continue;
+      }
+      if (prefilter.reason === "unknown-date") audit?.recordUnknownDate();
+
       if (checked >= MAX_DETAIL_PAGES) {
+        stop("detail-limit");
         console.log(`已达到详情页检查上限：${MAX_DETAIL_PAGES}`);
         return rows;
       }
 
-      seen.add(link.id);
       checked += 1;
+      audit?.recordChecked();
 
-      await waitRandom(detailPage, DETAIL_GAP_DELAY, "详情页间隔");
-      const detail = await scrapeNoteDetail(detailPage, link.detailUrl).catch((error) => {
-        console.warn(`打开笔记失败，跳过：${link.exportUrl}`);
-        console.warn(error.message || String(error));
-        return { tags: "", publishedAt: null, noteUrl: link.exportUrl, failed: true };
+      let detail = restoreXhsDetailFromCache(await detailCache.get(link.id));
+      if (detail) {
+        audit?.recordCacheHit();
+        console.log(`详情缓存命中：${accountName} ${link.exportUrl}`);
+      } else {
+        await waitRandom(detailPage, DETAIL_GAP_DELAY, "详情页间隔");
+        detail = await scrapeNoteDetail(detailPage, link.detailUrl, { resourceBlocker }).catch((error) => {
+          console.warn(`打开笔记失败，跳过：${link.exportUrl}`);
+          console.warn(error.message || String(error));
+          return { tags: "", publishedAt: null, noteUrl: link.exportUrl, failed: true };
+        });
+        if (isCacheableXhsDetail(detail)) {
+          await detailCache.set(link.id, serializeXhsDetailForCache(detail));
+        }
+      }
+      const risk = detailRiskGuard.record(detail);
+      if (detail.blocked) {
+        audit?.recordSkipped("detail-blocked");
+        console.warn(`详情页触发风控或不可浏览：${link.exportUrl} stateTime=${link.stateTimeValue ?? ""}`);
+        if (risk.shouldStop) {
+          stop("detail-blocked");
+          throw new Error(`小红书账号 ${accountName} 连续 ${risk.consecutiveBlocked} 次详情页触发风控，已停止该账号详情访问。`);
+        }
+        continue;
+      }
+      const effectivePublishedAt = resolveXhsPublishedAtEntry({
+        detailPublishedAt: detail.publishedAt,
+        detailPublishedAtSource: detail.publishedAtSource,
+        statePublishedAt: link.statePublishedAt,
+        statePublishedAtSource: link.statePublishedAtSource,
+        detailBlocked: detail.blocked
       });
-      const effectivePublishedAt = link.statePublishedAt || detail.publishedAt;
-      if (!effectivePublishedAt) {
-        console.warn(`未识别发布时间：${link.exportUrl} stateTime=${link.stateTimeValue ?? ""}`);
+      if (!effectivePublishedAt.publishedAt) {
+        const reason = detail.blocked ? "详情页触发风控或不可浏览" : "未识别发布时间";
+        console.warn(`${reason}：${link.exportUrl} stateTime=${link.stateTimeValue ?? ""} detailTime=${detail.dateCandidates ?? ""}`);
         continue;
       }
 
-      const publishedAt = formatDate(effectivePublishedAt);
-      if (effectivePublishedAt < SINCE) {
+      const publishedAt = dateKey(effectivePublishedAt.publishedAt);
+      const rangePosition = comparePublishedAtToDateRange({ publishedAt: effectivePublishedAt.publishedAt, since: SINCE, until: TODAY });
+      if (rangePosition === "before-since") {
         oldNoteRounds += 1;
-        console.log(`已到较早作品：${accountName} ${publishedAt} ${link.exportUrl}`);
+        console.log(`边界检查：发现早于开始日期的作品，不导出：${accountName} ${publishedAt} ${link.exportUrl}`);
         if ((hasInRangeNote || checked >= MIN_CHECK_BEFORE_STOP) && oldNoteRounds >= OLD_NOTE_STOP_AFTER) {
+          stop("old-boundary");
           console.log(`连续 ${OLD_NOTE_STOP_AFTER} 条早于起始日期，停止继续下翻：${accountName}`);
           return rows;
         }
@@ -188,29 +282,57 @@ async function crawlAccountRecentFirst({ listPage, detailPage, accountName, prof
 
       oldNoteRounds = 0;
 
-      if (effectivePublishedAt > TODAY) {
+      if (rangePosition === "after-until") {
         console.log(`跳过晚于结束日期作品：${accountName} ${publishedAt} ${link.exportUrl}`);
         continue;
       }
 
       hasInRangeNote = true;
+      audit?.recordHit();
+      const classification = await classifyContentType({
+        platformId: "xhs",
+        accountName,
+        title: link.title || "",
+        tags: detail.tags,
+        text: link.title || ""
+      });
       rows.push({
         accountName,
         publishedAt,
-        noteUrl: detail.noteUrl || link.exportUrl,
+        noteUrl: chooseXhsExportUrl(detail.noteUrl, link.exportUrl),
+        title: link.title || "",
         tags: detail.tags,
-        contentType: classifyTags(detail.tags)
+        publishedAtSource: effectivePublishedAt.source,
+        contentType: classification.contentType,
+        contentTypeReview: classification.contentTypeReview
       });
-      console.log(`命中：${accountName} ${publishedAt} ${detail.noteUrl || link.exportUrl}`);
+      console.log(`命中：${accountName} ${publishedAt} ${chooseXhsExportUrl(detail.noteUrl, link.exportUrl)}`);
     }
 
-    if (stableRounds >= 4 && stateLinks.length > 0) break;
+    if (stableRounds >= 4 && stateLinks.length > 0) {
+      stop("stable-rounds");
+      break;
+    }
 
     await listPage.mouse.wheel(0, 1400);
     await waitRandom(listPage, SCROLL_DELAY, "下翻停留");
   }
 
+  stop("scroll-limit");
   return rows;
+}
+
+async function getProfileStateLinks(listPage, { resourceBlocker } = {}) {
+  let links = await getPublishedNotesFromState(listPage);
+  if (links.length > 0 || !resourceBlocker?.enabled) return links;
+
+  console.log("列表页未读到作品，关闭轻量页面模式重试一次。");
+  links = await resourceBlocker.disableTemporarily(async () => {
+    await listPage.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await waitForProfileNotes(listPage);
+    return getPublishedNotesFromState(listPage);
+  });
+  return links;
 }
 
 async function waitForProfileNotes(page) {
@@ -242,19 +364,32 @@ async function getPublishedNotesFromState(page) {
         title: item.noteCard?.displayTitle || "",
         author: item.noteCard?.user?.nickName || "",
         cover: item.noteCard?.cover?.urlDefault || "",
-        timeValue: item.noteCard?.time || item.noteCard?.lastUpdateTime || item.noteCard?.publishTime || item.noteCard?.createTime || item.time || item.timestamp || null
+        timeFields: {
+          publishedAt: item.noteCard?.publishedAt || item.noteCard?.published_at || item.publishedAt || item.published_at || null,
+          publishAt: item.noteCard?.publishAt || item.noteCard?.publish_at || item.publishAt || item.publish_at || null,
+          publishTime: item.noteCard?.publishTime || item.noteCard?.publish_time || item.publishTime || item.publish_time || null,
+          publishedTime: item.noteCard?.publishedTime || item.noteCard?.published_time || item.publishedTime || item.published_time || null,
+          createTime: item.noteCard?.createTime || item.noteCard?.create_time || item.createTime || item.create_time || null,
+          createdTime: item.noteCard?.createdTime || item.noteCard?.created_time || item.createdTime || item.created_time || null,
+          lastUpdateTime: item.noteCard?.lastUpdateTime || item.noteCard?.last_update_time || item.lastUpdateTime || item.last_update_time || null,
+          time: item.noteCard?.time || item.time || null,
+          timestamp: item.timestamp || null
+        }
       }));
   }).catch(() => []);
 
   const stateNotes = notes.map((note) => {
-    const tokenPart = note.token ? `&xsec_token=${encodeURIComponent(note.token)}` : "";
-    const url = `https://www.xiaohongshu.com/discovery/item/${note.id}?source=webshare&xhsshare=pc_web${tokenPart}&xsec_source=pc_share`;
+    const url = buildXhsExploreUrl(note.id, note.token);
+    const statePublishedAt = resolveXhsStatePublishedAt(note.timeFields, {
+      referenceDateString: formatDate(REFERENCE_DATE)
+    });
     return {
       ...note,
       detailUrl: url,
       exportUrl: url,
-      statePublishedAt: parseStateTime(note.timeValue),
-      stateTimeValue: note.timeValue
+      statePublishedAt: statePublishedAt.publishedAt,
+      statePublishedAtSource: statePublishedAt.source,
+      stateTimeValue: statePublishedAt.rawValue
     };
   });
 
@@ -275,7 +410,16 @@ async function getPublishedNotesFromState(page) {
   return [...byId.values()];
 }
 
-async function scrapeNoteDetail(page, noteUrl) {
+async function scrapeNoteDetail(page, noteUrl, { resourceBlocker } = {}) {
+  const detail = await scrapeNoteDetailOnce(page, noteUrl);
+  if (shouldRetryXhsDetailUnblocked(detail) && resourceBlocker?.enabled) {
+    console.log("详情页关键字段未读到，关闭轻量页面模式重试一次。");
+    return resourceBlocker.disableTemporarily(() => scrapeNoteDetailOnce(page, noteUrl));
+  }
+  return detail;
+}
+
+async function scrapeNoteDetailOnce(page, noteUrl) {
   await page.goto(noteUrl, { waitUntil: "domcontentloaded" });
   await waitRandom(page, DETAIL_READ_DELAY, "详情页停留");
   const detail = await scrapeNoteDetailFromPage(page);
@@ -290,50 +434,40 @@ async function scrapeNoteDetailFromPage(page) {
   }
 
   const tags = extractTags(bodyText);
-  const dateText = await readDetailDateText(page);
-  const publishedAt = dateText ? parsePublishedAt(dateText) : extractPublishedAtFromDetailText(bodyText);
+  const dateTexts = await readDetailDateTexts(page);
+  const publishedAtResult = parseXhsDetailPublishedAt({
+    dateTexts,
+    bodyText,
+    referenceDateString: formatDate(REFERENCE_DATE)
+  });
 
-  return { tags, publishedAt };
+  return {
+    tags,
+    publishedAt: publishedAtResult.publishedAt,
+    publishedAtSource: publishedAtResult.source,
+    dateCandidates: publishedAtResult.candidates.join(" | ")
+  };
 }
 
-async function readDetailDateText(page) {
+async function readDetailDateTexts(page) {
   const selectors = [
     ".note-content .bottom-container .date",
     ".bottom-container .date",
     "span.date"
   ];
 
+  const texts = [];
   for (const selector of selectors) {
-    const text = await page.locator(selector).first().innerText({ timeout: 1200 }).catch(() => "");
-    if (text.trim()) return text.trim();
+    const values = await page.locator(selector).evaluateAll((elements) => {
+      return elements
+        .map((element) => element.innerText || element.textContent || "")
+        .map((text) => text.trim())
+        .filter(Boolean);
+    }).catch(() => []);
+    texts.push(...values);
   }
 
-  return "";
-}
-
-function extractPublishedAtFromDetailText(text) {
-  const lines = text
-    .split(/\n+/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const candidates = lines.filter((line) => {
-    if (line.length > 40) return false;
-    if (/^(刚刚|\d+\s*分钟前|\d+\s*小时前|\d+\s*天前|\d+\s*周前|昨天|今天)(?:\s+\d{1,2}:\d{2})?(?:\s+\S{2,8})?$/.test(line)) return true;
-    if (/^(发布于|编辑于|发表于)\s*(刚刚|\d+\s*分钟前|\d+\s*小时前|\d+\s*天前|\d+\s*周前|昨天|今天)(?:\s+\d{1,2}:\d{2})?(?:\s+\S{2,8})?$/.test(line)) return true;
-    if (/^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:\s+\S{2,8})?$/.test(line)) return true;
-    if (/^(发布于|编辑于|发表于)\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:\s+\S{2,8})?$/.test(line)) return true;
-    if (/^\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}:\d{2})?(?:\s+\S{2,8})?$/.test(line)) return true;
-    if (/^(发布于|编辑于|发表于)\s*\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}:\d{2})?(?:\s+\S{2,8})?$/.test(line)) return true;
-    return false;
-  });
-
-  for (const line of candidates) {
-    const date = parsePublishedAt(line);
-    if (date) return date;
-  }
-
-  return null;
+  return [...new Set(texts)];
 }
 
 function extractTags(text) {
@@ -341,74 +475,27 @@ function extractTags(text) {
   return [...new Set(matches)].join(" ");
 }
 
-function parsePublishedAt(text) {
-  const normalized = text.replace(/\s+/g, " ");
-
-  const fullDate = normalized.match(/(?:发布于|编辑于|发表于)?\s*(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?:\s|$)/);
-  if (fullDate) return parseDateOnly(`${fullDate[1]}-${pad(fullDate[2])}-${pad(fullDate[3])}`);
-
-  const monthDate = normalized.match(/(?:发布于|编辑于|发表于)?\s*(\d{1,2})[./-](\d{1,2})(?:\s+\d{1,2}:\d{2})?(?:\s|$)/);
-  if (monthDate) {
-    return parseDateOnly(`${TODAY.getFullYear()}-${pad(monthDate[1])}-${pad(monthDate[2])}`);
-  }
-
-  if (/今天|刚刚|\d+\s*分钟前|\d+\s*小时前/.test(normalized)) {
-    return cloneDate(TODAY);
-  }
-
-  if (/昨天/.test(normalized)) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - 1);
-    return date;
-  }
-
-  const daysAgo = normalized.match(/(\d+)\s*天前/);
-  if (daysAgo) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - Number(daysAgo[1]));
-    return date;
-  }
-
-  const weeksAgo = normalized.match(/(\d+)\s*周前/);
-  if (weeksAgo) {
-    const date = cloneDate(TODAY);
-    date.setDate(date.getDate() - Number(weeksAgo[1]) * 7);
-    return date;
-  }
-
-  return null;
-}
-
-function parseStateTime(value) {
-  if (!value) return null;
-  if (typeof value === "number") {
-    const milliseconds = value > 10_000_000_000 ? value : value * 1000;
-    return cloneDate(new Date(milliseconds));
-  }
-
-  const text = String(value).trim();
-  if (/^\d+$/.test(text)) {
-    return parseStateTime(Number(text));
-  }
-
-  return parsePublishedAt(text);
-}
-
-async function writeOutputs(rows) {
-  const baseName = `xhs_notes_${formatDate(SINCE)}_to_${formatDate(TODAY)}`;
+async function writeOutputs(rows, { accountName = "", audit = null, mode = "conservative" } = {}) {
+  const baseName = buildXhsOutputBaseName({
+    since: formatDate(SINCE),
+    until: formatDate(TODAY),
+    accountName
+  });
   const xlsPath = path.join(OUTPUT_DIR, `${baseName}.xls`);
   const csvPath = path.join(OUTPUT_DIR, `${baseName}.csv`);
-  const headers = ["账号名称", "发布时间", "作品链接", "笔记id", "TAG词", "内容类型"];
+  const jsonPath = path.join(OUTPUT_DIR, `${baseName}.json`);
+  const headers = ["账号名称", "发布时间", "作品链接", "笔记id", "TAG词", "内容类型", "内容类型标签审核"];
 
-  const sheetRows = rows.map((row, index) => {
-    const excelRow = index + 2;
+  const sheetRows = rows.map((row) => {
+    const noteUrl = normalizeXhsContentLink(row.noteUrl);
     return {
-      "账号名称": row.accountName,
+      "账号名称": spreadsheetSafeText(row.accountName),
       "发布时间": row.publishedAt,
-      "作品链接": row.noteUrl,
-      "笔记id": `=TEXTBEFORE(TEXTAFTER(C${excelRow},"item/"),"?")`,
-      "TAG词": row.tags || "",
-      "内容类型": row.contentType
+      "作品链接": noteUrl,
+      "笔记id": extractXhsNoteId(noteUrl),
+      "TAG词": spreadsheetSafeText(row.tags || ""),
+      "内容类型": spreadsheetSafeText(row.contentType),
+      "内容类型标签审核": spreadsheetSafeText(row.contentTypeReview || "")
     };
   });
 
@@ -419,22 +506,40 @@ async function writeOutputs(rows) {
     ...sheetRows.map((row) => headers.map((header) => csvEscape(row[header] || "")).join(","))
   ].join("\n");
   await fs.writeFile(csvPath, csv, "utf8");
+  await fs.writeFile(jsonPath, JSON.stringify({
+    platform: "xhs",
+    publishedAtVersion: XHS_DETAIL_CACHE_VERSION,
+    mode,
+    since: formatDate(SINCE),
+    until: formatDate(TODAY),
+    audit,
+    items: rows.map((row) => ({
+      platform: "xhs",
+      accountName: row.accountName,
+      publishedAt: row.publishedAt,
+      link: normalizeXhsContentLink(row.noteUrl),
+      id: extractXhsNoteId(row.noteUrl),
+      title: row.title || "",
+      tags: row.tags || "",
+      publishedAtSource: row.publishedAtSource || "",
+      contentType: row.contentType || "无",
+      contentTypeReview: row.contentTypeReview || "需审核"
+    }))
+  }, null, 2), "utf8");
 
   console.log(`XLS ：${xlsPath}`);
   console.log(`CSV ：${csvPath}`);
+  console.log(`JSON：${jsonPath}`);
 }
 
 function buildExcelXml(headers, rows) {
-  const widths = [120, 90, 520, 260, 320, 90];
+  const widths = [120, 90, 520, 260, 320, 90, 120];
   const headerCells = headers
     .map((header) => `<Cell ss:StyleID="header"><Data ss:Type="String">${xmlEscape(header)}</Data></Cell>`)
     .join("");
   const bodyRows = rows.map((row) => {
     const cells = headers.map((header) => {
       const value = row[header] || "";
-      if (header === "笔记id" && value.startsWith("=")) {
-        return `<Cell ss:Formula="=TEXTBEFORE(TEXTAFTER(RC[-1],&quot;item/&quot;),&quot;?&quot;)"><Data ss:Type="String"></Data></Cell>`;
-      }
       return `<Cell><Data ss:Type="String">${xmlEscape(value)}</Data></Cell>`;
     }).join("");
     return `<Row>${cells}</Row>`;
@@ -482,8 +587,7 @@ function normalizeNoteUrl(rawUrl) {
   if (!match) return null;
 
   const noteId = match[1];
-  const search = url.search || "?source=webshare";
-  const itemUrl = `https://www.xiaohongshu.com/discovery/item/${noteId}${search}`;
+  const itemUrl = normalizeXhsContentLink(url.toString());
 
   return {
     id: noteId,
@@ -498,20 +602,24 @@ function normalizeClickedNoteUrl(rawUrl, fallbackId = "") {
   const noteId = match?.[1] || fallbackId;
   if (!noteId) return "";
 
-  const search = url.search || "?source=webshare";
-  return `https://www.xiaohongshu.com/discovery/item/${noteId}${search}`;
+  return normalizeXhsContentLink(url.toString());
 }
 
-function isProfileUrl(url) {
-  return /xiaohongshu\.com\/user\/profile\//.test(url);
+function chooseXhsExportUrl(detailUrl, listUrl) {
+  const detail = normalizeXhsContentLink(detailUrl);
+  const list = normalizeXhsContentLink(listUrl);
+  if (list && hasXhsOpenParams(list) && !hasXhsOpenParams(detail)) return list;
+  return detail || list || "";
 }
 
-function normalizeProfileUrl(rawUrl) {
-  if (!rawUrl) return "";
-  const url = new URL(rawUrl, "https://www.xiaohongshu.com");
-  const match = url.pathname.match(/\/user\/profile\/([^/?#]+)/);
-  if (!match) return rawUrl;
-  return `https://www.xiaohongshu.com/user/profile/${match[1]}`;
+function hasXhsOpenParams(rawUrl) {
+  if (!rawUrl) return false;
+  try {
+    const url = new URL(rawUrl, "https://www.xiaohongshu.com");
+    return Boolean(url.searchParams.get("xsec_token") || url.searchParams.get("xsec_source"));
+  } catch {
+    return /[?&]xsec_(?:token|source)=/.test(String(rawUrl));
+  }
 }
 
 function parseArgs(args) {
@@ -539,6 +647,39 @@ function parseArgs(args) {
 
     if (arg.startsWith("--until=")) {
       options.until = arg.slice("--until=".length);
+      continue;
+    }
+
+    if (arg === "--reference-date") {
+      options.referenceDate = args[i + 1];
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--reference-date=")) {
+      options.referenceDate = arg.slice("--reference-date=".length);
+      continue;
+    }
+
+    if (arg === "--mode") {
+      options.mode = args[i + 1];
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--mode=")) {
+      options.mode = arg.slice("--mode=".length);
+      continue;
+    }
+
+    if (arg === "--account" || arg === "-a") {
+      options.account = args[i + 1];
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--account=")) {
+      options.account = arg.slice("--account=".length);
       continue;
     }
 
@@ -583,15 +724,6 @@ function parseDateInput(value, label) {
   return date;
 }
 
-function parseDateOnly(value) {
-  const [year, month, day] = value.split("-").map(Number);
-  return new Date(year, month - 1, day);
-}
-
-function cloneDate(date) {
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
-}
-
 function formatDate(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
@@ -623,6 +755,18 @@ async function waitRandom(page, range, label = "停留") {
 function randomBetween(min, max) {
   if (max <= min) return min;
   return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+function isCacheableXhsDetail(detail) {
+  return Boolean(detail && !detail.failed && !detail.blocked && detail.publishedAt);
+}
+
+function shouldRetryXhsDetailUnblocked(detail) {
+  return Boolean(detail?.blocked || !detail?.publishedAt);
+}
+
+function modeLabel(mode) {
+  return mode === "legacy" ? "兼容旧模式" : "保守提速";
 }
 
 main().catch((error) => {

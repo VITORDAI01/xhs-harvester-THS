@@ -28,7 +28,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -88,9 +89,9 @@ h2 {
   background: #eaf6f3;
 }
 
-.toolbar {
+.auth-panel {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto auto;
+  grid-template-columns: minmax(220px, 360px) auto 1fr;
   gap: 12px;
   align-items: end;
   padding: 16px;
@@ -99,6 +100,65 @@ h2 {
   background: var(--surface);
   box-shadow: var(--shadow);
   margin-bottom: 18px;
+}
+
+.auth-field {
+  min-width: 220px;
+}
+
+.auth-status {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.auth-status.error {
+  color: var(--danger);
+}
+
+.toolbar,
+.schedulebar {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  margin-bottom: 18px;
+}
+
+.toolbar {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+}
+
+.toolbar-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 260px));
+  gap: 12px;
+  align-items: end;
+}
+
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.toolbar-actions button {
+  min-width: 102px;
+}
+
+.schedulebar {
+  align-items: end;
+  grid-template-columns: minmax(190px, 1fr) auto minmax(130px, 150px) auto auto auto;
+  box-shadow: none;
+  margin-top: -4px;
 }
 
 .field {
@@ -112,7 +172,68 @@ h2 {
   font-weight: 700;
 }
 
-input {
+.field.compact {
+  min-width: 130px;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 42px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.toggle input {
+  width: 18px;
+  height: 18px;
+}
+
+.schedule-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 42px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.schedule-status.active {
+  color: var(--accent);
+}
+
+.login-check-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  width: 100%;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.login-check-status.valid {
+  color: var(--accent);
+}
+
+.login-check-status.invalid,
+.login-check-status.blocked,
+.login-check-status.error,
+.login-check-status.missing_profile,
+.login-check-status.empty_profile {
+  color: var(--danger);
+}
+
+.login-check-status.checking,
+.login-check-status.unknown {
+  color: #756016;
+}
+
+input,
+select {
   height: 42px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -122,7 +243,8 @@ input {
   outline: none;
 }
 
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(36, 118, 111, 0.14);
 }
@@ -177,7 +299,7 @@ button:disabled {
 
 .platform-tabs {
   display: inline-grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 4px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -289,6 +411,9 @@ button:disabled {
   }
 
   .toolbar,
+  .auth-panel,
+  .schedulebar,
+  .toolbar-fields,
   .workspace {
     grid-template-columns: 1fr;
   }
@@ -297,7 +422,8 @@ button:disabled {
     width: 100%;
   }
 
-  .toolbar {
+  .toolbar,
+  .toolbar-actions {
     align-items: stretch;
   }
 
